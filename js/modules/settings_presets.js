@@ -8,17 +8,127 @@ function _saveBubblePresets(arr) {
     saveData();
 }
 
-function populateBubblePresetSelect(selectId) { 
-    const sel = document.getElementById(selectId); 
+// 黑白预设搜索：保留原 select，继续使用原来的应用和导入导出入口。
+const bubblePresetSearchUI = (() => {
+    let modal, input, list, count, clear, source, returnFocus;
+    const buttons = new Map();
+    const normalize = value => String(value || '').normalize('NFKC').toLowerCase().replace(/[\s\p{P}\p{S}]/gu, '');
+    function score(name, query) {
+        const text = normalize(name), q = normalize(query);
+        if (!q) return 1;
+        if (text === q) return 4;
+        if (text.includes(q)) return 3;
+        let i = 0;
+        for (const char of text) if (char === q[i]) i++;
+        return i === q.length ? 2 : 0;
+    }
+    function ensureModal() {
+        if (modal) return;
+        const style = document.createElement('style');
+        style.textContent = `
+        .bps-trigger{appearance:none!important;display:flex!important;align-items:center;gap:8px;min-width:108px;max-width:180px;padding:6px 10px!important;border:1px solid #ddd!important;border-radius:9px!important;background:#fff!important;color:#111!important;font:inherit;font-size:12px;cursor:pointer}
+        .bps-trigger span{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;text-align:left}.bps-trigger svg{flex:none}
+        .bps-overlay{position:fixed;inset:0;z-index:2147483646;background:rgba(0,0,0,.32);display:flex;align-items:center;justify-content:center;padding:16px;box-sizing:border-box;font-family:inherit;color:#111;color-scheme:light}
+        .bps-overlay[hidden]{display:none!important}
+        .bps-dialog{width:100%;max-width:380px;max-height:calc(100dvh - 32px);display:flex;flex-direction:column;box-sizing:border-box;background:#fff;border:1px solid #e6e6e6;border-radius:20px;box-shadow:0 16px 60px #0002;overflow:hidden}
+        .bps-dialog *{box-sizing:border-box}.bps-header{display:flex;align-items:center;justify-content:space-between;padding:20px 20px 14px}.bps-kicker{font-size:10px;letter-spacing:2px;color:#888;margin-bottom:5px}.bps-title{font-size:19px;font-weight:650;margin:0;color:#111}
+        .bps-icon{border:0!important;background:transparent!important;color:#111!important;width:32px;height:32px;border-radius:50%;padding:7px!important;cursor:pointer;display:grid;place-items:center}.bps-icon:hover{background:#eee!important}
+        .bps-search{display:flex;align-items:center;gap:8px;margin:0 20px;border:1px solid #e1e1e1;border-radius:999px;background:#f5f5f5;padding:4px 8px 4px 13px;flex:none}.bps-search:focus-within{border-color:#111;background:#fff}.bps-search svg{flex:none;color:#777}
+        .bps-input{width:100%;min-width:0;appearance:none!important;background:transparent!important;border:0!important;box-shadow:none!important;outline:none!important;padding:7px 0!important;color:#111!important;font:inherit;font-size:16px!important;border-radius:0!important}.bps-input::placeholder{color:#999}
+        .bps-count{padding:14px 22px 8px;font-size:10px;color:#888;letter-spacing:1px;flex:none}.bps-list{overflow-y:auto;overscroll-behavior:contain;min-height:0;max-height:46dvh;padding:0 10px 10px;-webkit-overflow-scrolling:touch}
+        .bps-row{display:flex;align-items:center;gap:10px;border-bottom:1px solid #f0f0f0;padding:5px 0}.bps-name{flex:1;min-width:0;border:0!important;background:transparent!important;color:#111!important;text-align:left!important;padding:10px!important;font:inherit;font-size:13px;line-height:1.5;overflow-wrap:anywhere;cursor:pointer;border-radius:8px!important}.bps-name small{display:block;font-size:10px;color:#888;margin-top:2px}.bps-name:hover{background:#f5f5f5!important}.bps-row.is-selected .bps-name{font-weight:650}
+        .bps-apply{flex:none;background:#111!important;color:#fff!important;border:0!important;border-radius:999px!important;padding:7px 12px!important;font:inherit;font-size:11px;cursor:pointer;margin-right:8px}.bps-apply:hover{background:#333!important}.bps-empty{padding:35px 10px;text-align:center;font-size:13px;color:#888}.bps-footer{padding:12px 20px 16px;border-top:1px solid #eee;color:#999;font-size:10px;letter-spacing:.4px}.bps-dialog button:focus-visible{outline:2px solid #111;outline-offset:2px}
+        @media(max-width:480px){.bps-overlay{align-items:flex-end;padding:12px;padding-bottom:max(12px,env(safe-area-inset-bottom))}.bps-dialog{max-width:100%;border-radius:22px}.bps-list{max-height:42dvh}}
+        `;
+        document.head.appendChild(style);
+        modal = document.createElement('div');
+        modal.className = 'bps-overlay'; modal.hidden = true;
+        modal.innerHTML = `<section class="bps-dialog" role="dialog" aria-modal="true" aria-labelledby="bps-title"><header class="bps-header"><div><div class="bps-kicker">YOUR COLLECTION</div><h2 class="bps-title" id="bps-title">选择美化预设</h2></div><button class="bps-icon bps-close" type="button" aria-label="关闭"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="m6 6 12 12M18 6 6 18"/></svg></button></header><div class="bps-search"><svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6"><circle cx="10.5" cy="10.5" r="6.5"/><path d="m16 16 4.5 4.5"/></svg><input class="bps-input" type="text" inputmode="search" placeholder="输入名称的部分字样…" aria-label="搜索美化预设" autocomplete="off"><button class="bps-icon bps-clear" type="button" aria-label="清空搜索">×</button></div><div class="bps-count" aria-live="polite"></div><div class="bps-list"></div><footer class="bps-footer">点击名称选择 · 点击应用直接使用</footer></section>`;
+        document.body.appendChild(modal);
+        input = modal.querySelector('input'); list = modal.querySelector('.bps-list'); count = modal.querySelector('.bps-count'); clear = modal.querySelector('.bps-clear');
+        input.addEventListener('input', render);
+        clear.onclick = () => { input.value = ''; render(); input.focus(); };
+        modal.querySelector('.bps-close').onclick = close;
+        modal.addEventListener('click', event => { if (event.target === modal) close(); });
+        modal.addEventListener('keydown', event => {
+            if (event.key === 'Escape') { event.preventDefault(); close(); }
+            if (event.key === 'Enter' && event.target === input) { event.preventDefault(); list.querySelector('.bps-name')?.click(); }
+            if (event.key === 'Tab') {
+                const focusable = [...modal.querySelectorAll('button,input')].filter(el => !el.disabled && el.getClientRects().length);
+                const first = focusable[0], last = focusable[focusable.length - 1];
+                if (event.shiftKey && document.activeElement === first) { event.preventDefault(); last.focus(); }
+                else if (!event.shiftKey && document.activeElement === last) { event.preventDefault(); first.focus(); }
+            }
+        });
+    }
+    function close() {
+        if (!modal) return;
+        modal.hidden = true;
+        returnFocus?.setAttribute('aria-expanded', 'false');
+        if (returnFocus?.isConnected) returnFocus.focus({preventScroll:true});
+        source = null;
+    }
+    function choose(name, apply) {
+        if (!source) return;
+        const select = source;
+        select.value = name;
+        select.dispatchEvent(new Event('change', {bubbles:true}));
+        sync(select);
+        close();
+        if (apply) applyPresetToCurrentChat(name);
+    }
+    function render() {
+        if (!source) return;
+        const query = input.value;
+        const presets = _getBubblePresets();
+        const results = presets.map((preset, index) => ({preset,index,rank:score(preset.name,query)})).filter(item => item.rank).sort((a,b) => b.rank-a.rank || a.index-b.index);
+        count.textContent = `${results.length} / ${presets.length} PRESETS`;
+        clear.style.visibility = query ? 'visible' : 'hidden';
+        list.replaceChildren(); list.scrollTop = 0;
+        if (!results.length) {
+            const empty = document.createElement('div'); empty.className = 'bps-empty';
+            empty.textContent = presets.length ? '没有匹配的预设，换个字试试' : '还没有预设，可以先导入或保存';
+            list.appendChild(empty); return;
+        }
+        results.forEach(({preset}) => {
+            const row = document.createElement('div'); row.className = 'bps-row' + (source.value === preset.name ? ' is-selected' : '');
+            const name = document.createElement('button'); name.type = 'button'; name.className = 'bps-name'; name.textContent = preset.name;
+            if (source.value === preset.name) { const note = document.createElement('small'); note.textContent = '已选择'; name.appendChild(note); }
+            name.onclick = () => choose(preset.name,false);
+            const apply = document.createElement('button'); apply.type = 'button'; apply.className = 'bps-apply'; apply.textContent = '应用'; apply.setAttribute('aria-label',`应用 ${preset.name}`); apply.onclick = () => choose(preset.name,true);
+            row.append(name,apply); list.appendChild(row);
+        });
+    }
+    function sync(select) {
+        const button = buttons.get(select);
+        if (button) button.querySelector('span').textContent = select.value || '选择预设';
+        if (source === select && !modal.hidden) render();
+    }
+    function attach(select) {
+        if (buttons.has(select)) { sync(select); return; }
+        ensureModal();
+        const button = document.createElement('button'); button.type = 'button'; button.className = 'bps-trigger'; button.setAttribute('aria-haspopup','dialog'); button.setAttribute('aria-expanded','false');
+        button.innerHTML = '<span>选择预设</span><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6"><circle cx="10" cy="10" r="6"/><path d="m15 15 5 5"/></svg>';
+        select.hidden = true; select.style.setProperty('display','none','important'); select.after(button); buttons.set(select,button);
+        select.addEventListener('change',() => sync(select));
+        button.onclick = () => { source = select; returnFocus = button; input.value = ''; modal.hidden = false; button.setAttribute('aria-expanded','true'); render(); input.focus({preventScroll:true}); };
+        sync(select);
+    }
+    return {attach};
+})();
+
+function populateBubblePresetSelect(selectId) {
+    const sel = document.getElementById(selectId);
     if (!sel) return;
+    const previous = sel.value;
     const presets = _getBubblePresets();
     sel.innerHTML = '<option value="">— 选择预设 —</option>';
-    presets.forEach((p) => {
+    presets.forEach(p => {
         const opt = document.createElement('option');
-        opt.value = p.name;
-        opt.textContent = p.name;
-        sel.appendChild(opt);
+        opt.value = p.name; opt.textContent = p.name; sel.appendChild(opt);
     });
+    if (presets.some(p => p.name === previous)) sel.value = previous;
+    bubblePresetSearchUI.attach(sel);
 }
 
 async function applyPresetToCurrentChat(presetName) {

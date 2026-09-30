@@ -326,10 +326,12 @@ async function handleExport() {
                 if (!selectedModules.chats) {
                     exportChar.history = [];
                     exportChar.callHistory = [];
+                    delete exportChar.archives;
+                    delete exportChar.activeArchiveId;
                 }
                 if (!selectedModules.contacts) {
                     // If only exporting chats, we still need basic info to identify the char
-                    exportChar = { id: char.id, name: char.name, history: char.history, callHistory: char.callHistory };
+                    exportChar = { id: char.id, name: char.name, history: char.history, callHistory: char.callHistory, archives: char.archives, activeArchiveId: char.activeArchiveId };
                 }
                 // 始终不导出 gallery
                 exportChar.gallery = [];
@@ -341,9 +343,11 @@ async function handleExport() {
                 if (!selectedModules.chats) {
                     exportGroup.history = [];
                     exportGroup.callHistory = [];
+                    delete exportGroup.archives;
+                    delete exportGroup.activeArchiveId;
                 }
                 if (!selectedModules.contacts) {
-                    exportGroup = { id: group.id, name: group.name, history: group.history, callHistory: group.callHistory };
+                    exportGroup = { id: group.id, name: group.name, history: group.history, callHistory: group.callHistory, archives: group.archives, activeArchiveId: group.activeArchiveId };
                 }
                 exportData.modules.groups.push(exportGroup);
             });
@@ -388,7 +392,8 @@ async function handleExport() {
                 'globalReceiveSound', 'multiMsgSoundEnabled', 'soundPresets', 'galleryPresets', 
                 'hasSeenVideoCallDisclaimer', 'hasSeenVideoCallAvatarHint', 'workshopSettings', 
                 'workshopLlmPresets', 'workshopPromptPresets', 'homeLayoutOrder', 'homeLayoutPages', 
-                'widgetTemplates', 'addedWidgets', 'backupReminderSettings', 'stUnlocked'
+                'widgetTemplates', 'addedWidgets', 'backupReminderSettings', 'stUnlocked',
+                    'homePresets', 'activeHomePresetId', 'homePresetUndo'
             ];
             settingsKeys.forEach(key => {
                 exportData.modules[key] = db[key];
@@ -455,22 +460,8 @@ async function handleImport(event) {
     importText.textContent = '处理中...';
 
     try {
-        let jsonString;
-        if (file.name.endsWith('.ee')) {
-            const decompressionStream = new DecompressionStream('gzip');
-            const decompressedStream = file.stream().pipeThrough(decompressionStream);
-            jsonString = await new Response(decompressedStream).text();
-        } else {
-            jsonString = await file.text();
-        }
-
-        const importedData = JSON.parse(jsonString);
-            if (!importedData.modules) {
-                // 兼容旧版备份格式
-                importedData.modules = importedData;
-            }
-
-            const mods = importedData.modules;
+        // 与“教程 → 导入数据”共用格式识别：gzip/普通 JSON、旧版/流式/分类备份。
+        const mods = await readBackupFile(file);
 
             // 1. Chats & Contacts
             if ((selectedModules.chats || selectedModules.contacts) && mods.characters) {
@@ -478,21 +469,27 @@ async function handleImport(event) {
                     const existingCharIndex = db.characters.findIndex(c => c.id === importedChar.id);
                     if (existingCharIndex !== -1) {
                         let existingChar = db.characters[existingCharIndex];
-                        if (selectedModules.chats && importedChar.history) {
-                            existingChar.history = importedChar.history;
+                        if (selectedModules.chats && (importedChar.history !== undefined || importedChar.archives !== undefined)) {
+                            if (importedChar.history !== undefined) existingChar.history = importedChar.history;
                             existingChar.callHistory = importedChar.callHistory || [];
+                            if (importedChar.archives !== undefined) existingChar.archives = importedChar.archives;
+                            if (importedChar.activeArchiveId !== undefined) existingChar.activeArchiveId = importedChar.activeArchiveId;
                         }
                         if (selectedModules.contacts) {
                             // Merge contact info, keep existing history if not importing chats
                             const tempHistory = existingChar.history;
                             const tempCallHistory = existingChar.callHistory;
                             const tempGallery = existingChar.gallery;
+                            const tempArchives = existingChar.archives;
+                            const tempArchiveId = existingChar.activeArchiveId;
                             
                             Object.assign(existingChar, importedChar);
                             
                             if (!selectedModules.chats) {
                                 existingChar.history = tempHistory;
                                 existingChar.callHistory = tempCallHistory;
+                                existingChar.archives = tempArchives;
+                                existingChar.activeArchiveId = tempArchiveId;
                             }
                             // 始终保留原有的 gallery
                             existingChar.gallery = tempGallery;
@@ -509,17 +506,23 @@ async function handleImport(event) {
                     const existingGroupIndex = db.groups.findIndex(g => g.id === importedGroup.id);
                     if (existingGroupIndex !== -1) {
                         let existingGroup = db.groups[existingGroupIndex];
-                        if (selectedModules.chats && importedGroup.history) {
-                            existingGroup.history = importedGroup.history;
+                        if (selectedModules.chats && (importedGroup.history !== undefined || importedGroup.archives !== undefined)) {
+                            if (importedGroup.history !== undefined) existingGroup.history = importedGroup.history;
                             existingGroup.callHistory = importedGroup.callHistory || [];
+                            if (importedGroup.archives !== undefined) existingGroup.archives = importedGroup.archives;
+                            if (importedGroup.activeArchiveId !== undefined) existingGroup.activeArchiveId = importedGroup.activeArchiveId;
                         }
                         if (selectedModules.contacts) {
                             const tempHistory = existingGroup.history;
                             const tempCallHistory = existingGroup.callHistory;
+                            const tempArchives = existingGroup.archives;
+                            const tempArchiveId = existingGroup.activeArchiveId;
                             Object.assign(existingGroup, importedGroup);
                             if (!selectedModules.chats) {
                                 existingGroup.history = tempHistory;
                                 existingGroup.callHistory = tempCallHistory;
+                                existingGroup.archives = tempArchives;
+                                existingGroup.activeArchiveId = tempArchiveId;
                             }
                         }
                     } else if (selectedModules.contacts) {
@@ -567,7 +570,8 @@ async function handleImport(event) {
                     'globalReceiveSound', 'multiMsgSoundEnabled', 'soundPresets', 'galleryPresets', 
                     'hasSeenVideoCallDisclaimer', 'hasSeenVideoCallAvatarHint', 'workshopSettings', 
                     'workshopLlmPresets', 'workshopPromptPresets', 'homeLayoutOrder', 'homeLayoutPages', 
-                    'widgetTemplates', 'addedWidgets', 'backupReminderSettings', 'stUnlocked'
+                    'widgetTemplates', 'addedWidgets', 'backupReminderSettings', 'stUnlocked',
+                    'homePresets', 'activeHomePresetId', 'homePresetUndo'
                 ];
                 settingsKeys.forEach(key => {
                     if (mods[key] !== undefined) {

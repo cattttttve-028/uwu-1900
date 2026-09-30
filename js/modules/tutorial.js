@@ -612,12 +612,14 @@ async function createFullBackupData() {
 
 // 同时读取旧版单 JSON 备份和 3.0 流式备份；完整校验通过后才允许清空现有数据。
 async function readBackupFile(blob) {
-    const reader = blob.stream()
-        .pipeThrough(new DecompressionStream('gzip'))
-        .pipeThrough(new TextDecoderStream())
-        .getReader();
+    const magic = new Uint8Array(await blob.slice(0, 2).arrayBuffer());
+    let stream = blob.stream();
+    if (magic[0] === 0x1f && magic[1] === 0x8b) {
+        stream = stream.pipeThrough(new DecompressionStream('gzip'));
+    }
+    const reader = stream.pipeThrough(new TextDecoderStream()).getReader();
     let pending = '';
-    let legacyText = '';
+    const legacyParts = [];
     let mode = null;
     let header = null;
     let footer = null;
@@ -636,6 +638,7 @@ async function readBackupFile(blob) {
             if (record.type !== 'header' || record.format !== 'ovo-stream-backup' || record.formatRevision !== 1) {
                 throw new Error('不支持的流式备份格式');
             }
+            if (!Array.isArray(record.dataKeys) || record.dataKeys.some(key => typeof key !== 'string' || ['__proto__', 'constructor', 'prototype'].includes(key))) throw new Error('流式备份字段清单无效');
             header = record;
             return;
         }
@@ -710,17 +713,22 @@ async function readBackupFile(blob) {
         while (true) {
             const { value, done } = await reader.read();
             if (done) break;
+            if (mode === 'legacy') { legacyParts.push(value); continue; }
             pending += value;
             if (mode === null) {
                 const newline = pending.indexOf('\n');
-                if (newline < 0) continue;
+                // 正常流式头记录很短；单个大 JSON 不应一直等待换行并反复拼接。
+                if (newline < 0) {
+                    if (pending.length < 65536) continue;
+                    mode = 'legacy'; legacyParts.push(pending); pending = ''; continue;
+                }
                 const firstLine = pending.slice(0, newline).trim();
                 let first;
                 try { first = JSON.parse(firstLine); } catch (_) { /* 旧版格式可能跨行 */ }
                 mode = first && first.type === 'header' && first.format === 'ovo-stream-backup' ? 'stream' : 'legacy';
             }
             if (mode === 'legacy') {
-                legacyText += pending;
+                legacyParts.push(pending);
                 pending = '';
                 continue;
             }
@@ -734,118 +742,108 @@ async function readBackupFile(blob) {
             // 单行 JSON 是旧版格式；空文件交给 JSON.parse 报错。
             mode = 'legacy';
         }
-        if (mode === 'legacy') return JSON.parse(legacyText + pending);
+        if (mode === 'legacy') {
+            if (pending) legacyParts.push(pending);
+            return normalizeBackupPayload(JSON.parse(legacyParts.join('').replace(/^\uFEFF/, '')));
+        }
         processLine(pending);
         if (!footer) throw new Error('备份缺少完成标记，可能下载不完整');
         // dataKeys 是可导出的字段清单，未设置的可选字段不会产生记录。
         if (!Object.keys(data).length) throw new Error('备份中没有可导入的数据');
         data._exportVersion = header.exportVersion;
         data._exportTimestamp = header.exportTimestamp;
-        return data;
+        return normalizeBackupPayload(data);
     } finally {
         reader.releaseLock();
     }
 }
 
-// 导入备份数据
+// 同一个兼容层供完整恢复、GitHub 恢复、分类导入使用。
+function normalizeBackupPayload(payload) {
+    const object = value => value && typeof value === 'object' && !Array.isArray(value);
+    if (!object(payload)) throw new Error('备份必须是 JSON 对象');
+    const data = object(payload.modules) ? { ...payload.modules,
+        _exportVersion: payload._exportVersion || payload.modules._exportVersion,
+        _exportTimestamp: payload._exportTimestamp || payload.modules._exportTimestamp } : { ...payload };
+    const arrays = ['characters', 'groups', 'worldBooks', 'myStickers'];
+    const known = [...arrays, ...globalSettingKeys];
+    if (!known.some(key => data[key] !== undefined)) throw new Error('文件中没有可识别的小手机备份数据');
+    for (const key of arrays) {
+        if (data[key] !== undefined && !Array.isArray(data[key])) throw new Error(`备份中的 ${key} 必须是数组`);
+        const ids = new Set();
+        for (const record of data[key] || []) {
+            if (!object(record) || !['string', 'number'].includes(typeof record.id) || record.id === '') throw new Error(`${key} 中有缺少 ID 的记录`);
+            if (ids.has(record.id)) throw new Error(`${key} 中存在重复 ID`);
+            ids.add(record.id);
+        }
+    }
+    const chunks = data.__chunks__ || payload.__chunks__;
+    function history(value) {
+        if (value === undefined) return value;
+        if (!Array.isArray(value)) throw new Error('聊天历史不是数组');
+        if (!value.length || value.every(item => object(item))) return value;
+        if (!value.every(item => typeof item === 'string') || !object(chunks)) throw new Error('旧版聊天记录缺少分块数据');
+        const result = [];
+        for (const key of value) {
+            if (!Object.prototype.hasOwnProperty.call(chunks, key)) throw new Error('旧版聊天记录分块缺失，未导入');
+            const chunk = typeof chunks[key] === 'string' ? JSON.parse(chunks[key]) : chunks[key];
+            if (!Array.isArray(chunk) || !chunk.every(item => object(item))) throw new Error('旧版聊天分块格式无效');
+            for (const message of chunk) result.push(message);
+        }
+        return result;
+    }
+    for (const key of ['characters', 'groups']) {
+        if (data[key] === undefined) continue;
+        data[key] = data[key].map(chat => {
+            const result = { ...chat };
+            if (chat.history !== undefined) result.history = history(chat.history);
+            if (chat.archives !== undefined) {
+                if (!Array.isArray(chat.archives)) throw new Error('聊天存档不是数组');
+                result.archives = chat.archives.map(archive => {
+                    if (!object(archive) || !object(archive.data)) throw new Error('聊天存档内容不完整');
+                    const copy = { ...archive, data: { ...archive.data } };
+                    if (archive.data.history !== undefined) copy.data.history = history(archive.data.history);
+                    return copy;
+                });
+            }
+            return result;
+        });
+    }
+    if (data._exportVersion !== '3.0' && data.worldBooks) {
+        data.worldBooks = data.worldBooks.map(item => item.type === 'entry' && ['middle', 'center'].includes(item.position)
+            ? { ...item, position: 'before', depth: 300 } : item);
+    }
+    return data;
+}
+
+// 校验在写入之前完成；一次事务失败会回滚，不先清空旧数据。
 async function importBackupData(data) {
     const startTime = Date.now();
     try {
-        await Promise.all([
-            dexieDB.characters.clear(),
-            dexieDB.groups.clear(),
-            dexieDB.worldBooks.clear(),
-            dexieDB.myStickers.clear(),
-            dexieDB.globalSettings.clear()
-        ]);
-        showToast('正在清空旧数据...');
-
-        let convertedData = data;
-
-        if (data._exportVersion !== '3.0') {
-            showToast('检测到旧版备份文件，正在转换格式...');
-            
-            const reassembleHistory = (chat, backupData) => {
-                if (!chat.history || !Array.isArray(chat.history) || chat.history.length === 0) {
-                    return [];
-                }
-                if (typeof chat.history[0] === 'object' && chat.history[0] !== null) {
-                    return chat.history;
-                }
-                if (backupData.__chunks__ && typeof chat.history[0] === 'string') {
-                    let fullHistory = [];
-                    chat.history.forEach(key => {
-                        if (backupData.__chunks__[key]) {
-                            try {
-                                const chunk = JSON.parse(backupData.__chunks__[key]);
-                                fullHistory = fullHistory.concat(chunk);
-                            } catch (e) {
-                                console.error(`Failed to parse history chunk ${key}`, e);
-                            }
-                        }
-                    });
-                    return fullHistory;
-                }
-                return []; 
-            };
-
-            const newData = { ...data };
-
-            if (newData.characters) {
-                newData.characters = newData.characters.map(char => ({
-                    ...char,
-                    history: reassembleHistory(char, data)
-                }));
-            }
-            if (newData.groups) {
-                newData.groups = newData.groups.map(group => ({
-                    ...group,
-                    history: reassembleHistory(group, data)
-                }));
-            }
-
-            // 兼容性处理：将旧版“世界书·中”转换为“世界书·前 + 深度300”
-            if (newData.worldBooks && Array.isArray(newData.worldBooks)) {
-                newData.worldBooks = newData.worldBooks.map(item => {
-                    if (item.type === 'entry' && (item.position === 'middle' || item.position === 'center')) {
-                        return {
-                            ...item,
-                            position: 'before',
-                            depth: 300
-                        };
-                    }
-                    return item;
-                });
-            }
-            
-            convertedData = newData;
+        const convertedData = normalizeBackupPayload(data);
+        const patch = {};
+        const coreKeys = ['characters', 'groups', 'worldBooks', 'myStickers'];
+        for (const key of [...new Set([...coreKeys, ...globalSettingKeys])]) {
+            if (convertedData[key] !== undefined) patch[key] = convertedData[key];
         }
-
-        Object.keys(db).forEach(key => {
-            if (convertedData[key] !== undefined) {
-                db[key] = convertedData[key];
+        showToast('正在写入备份数据...');
+        await dexieDB.transaction('rw', [dexieDB.characters, dexieDB.groups,
+            dexieDB.worldBooks, dexieDB.myStickers, dexieDB.globalSettings], async () => {
+            for (const key of coreKeys) {
+                if (patch[key] === undefined) continue;
+                await dexieDB[key].clear();
+                if (patch[key].length) await dexieDB[key].bulkPut(patch[key]);
+            }
+            for (const key of globalSettingKeys) {
+                if (patch[key] !== undefined) await dexieDB.globalSettings.put({ key, value: patch[key] });
             }
         });
-        
-        if (!db.insWidgetSettings) db.insWidgetSettings = { avatar1: 'https://i.postimg.cc/Y96LPskq/o-o-2.jpg', bubble1: 'love u.', avatar2: 'https://i.postimg.cc/GtbTnxhP/o-o-1.jpg', bubble2: 'miss u.' };
-        if (!db.homeWidgetSettings) db.homeWidgetSettings = JSON.parse(JSON.stringify(defaultWidgetSettings));
-
-
-        showToast('正在写入新数据...');
-        await saveData(db);
-
-        const duration = Date.now() - startTime;
-        const message = `导入完成 (耗时${duration}ms)`;
-        
-        return { success: true, message: message };
-
+        // 不调用会重建活动存档的 saveData；备份的 history、archives 按原内容保存。
+        Object.assign(db, patch);
+        return { success: true, message: `导入完成 (耗时${Date.now() - startTime}ms)` };
     } catch (error) {
         console.error('导入数据失败:', error);
-        return {
-            success: false,
-            error: error.message,
-            duration: Date.now() - startTime
-        };
+        return { success: false, error: error.message, duration: Date.now() - startTime };
     }
 }
 

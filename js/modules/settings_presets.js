@@ -1132,3 +1132,165 @@ function openSoundManageModal() {
 
     modal.style.display = 'flex';
 }
+
+
+// 三个指定入口：黑白预设搜索（2026-10-02）
+(() => {
+    const configurations = {
+        "setting-status-preset-select": {title:"快速填充预设", hint:"点击预设自动填充 · 保存聊天设置后生效", wide:true},
+        "cot-preset-select": {title:"选择思维链预设", hint:"点击预设即可切换当前思维链", wide:true},
+        "setting-exclusive-cot-preset": {title:"专属思维链预设", hint:"点击选择 · 保存聊天设置后生效", wide:false}
+    };
+    const selector = Object.keys(configurations).map(id => "#" + id).join(",");
+    let modal, input, list, count, clear, source, returnFocus;
+    const buttons = new Map();
+    let previousOverflow = '';
+    let composing = false;
+    const normalize = value => String(value || '').normalize('NFKC').toLowerCase().replace(/[\s\p{P}\p{S}]/gu, '');
+    function score(name, query) {
+        const text = normalize(name), q = normalize(query);
+        if (!q) return 1;
+        if (text === q) return 4;
+        if (text.includes(q)) return 3;
+        let i = 0;
+        for (const char of text) if (char === q[i]) i++;
+        return i === q.length ? 2 : 0;
+    }
+    function ensureModal() {
+        if (modal) return;
+        const style = document.createElement('style');
+        style.textContent = `
+        .tps-trigger{appearance:none!important;display:flex!important;align-items:center;gap:8px;min-width:0;max-width:180px;padding:8px 12px!important;border:1px solid #ddd!important;border-radius:9px!important;background:#fff!important;color:#111!important;font:inherit;font-size:12px;cursor:pointer}
+        .tps-trigger.tps-wide{width:100%;max-width:none;flex:1}.tps-trigger:not(.tps-wide){min-width:90px;max-width:150px}.tps-trigger span{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;text-align:left}.tps-trigger svg{flex:none}
+        .tps-overlay{position:fixed;inset:0;z-index:2147483646;background:rgba(0,0,0,.32);display:flex;align-items:center;justify-content:center;padding:16px;box-sizing:border-box;font-family:inherit;color:#111;color-scheme:light}
+        .tps-overlay[hidden]{display:none!important}
+        .tps-dialog{width:100%;max-width:380px;max-height:calc(100vh - 32px);max-height:calc(100dvh - 32px);display:flex;flex-direction:column;box-sizing:border-box;background:#fff;border:1px solid #e6e6e6;border-radius:20px;box-shadow:0 16px 60px #0002;overflow:hidden}
+        .tps-dialog *{box-sizing:border-box}.tps-header{display:flex;align-items:center;justify-content:space-between;padding:20px 20px 14px}.tps-kicker{font-size:10px;letter-spacing:2px;color:#888;margin-bottom:5px}.tps-title{font-size:20px;font-weight:700;margin:0;color:#111}
+        .tps-icon{border:0!important;background:transparent!important;color:#111!important;width:32px;height:32px;border-radius:50%;padding:7px!important;cursor:pointer;display:grid;place-items:center}.tps-icon:hover{background:#eee!important}
+        .tps-search{display:flex;align-items:center;gap:8px;margin:0 20px;border:1px solid #e1e1e1;border-radius:999px;background:#f5f5f5;padding:4px 8px 4px 13px;flex:none}.tps-search:focus-within{border-color:#111;background:#fff}.tps-search svg{flex:none;color:#777}
+        .tps-input{width:100%;min-width:0;appearance:none!important;background:transparent!important;border:0!important;box-shadow:none!important;outline:none!important;padding:7px 0!important;color:#111!important;font:inherit;font-size:16px!important;border-radius:0!important}.tps-input::placeholder{color:#999}
+        .tps-count{padding:14px 22px 8px;font-size:10px;color:#888;letter-spacing:1px;flex:none}.tps-list{overflow-y:auto;overscroll-behavior:contain;min-height:0;max-height:46vh;max-height:46dvh;padding:0 10px 10px;-webkit-overflow-scrolling:touch}
+        .tps-row{display:flex;align-items:center;gap:10px;border-bottom:1px solid #f0f0f0;padding:5px 0}.tps-name{flex:1;min-width:0;border:0!important;background:transparent!important;color:#111!important;text-align:left!important;padding:10px!important;font:inherit;font-size:13px;line-height:1.5;overflow-wrap:anywhere;cursor:pointer;border-radius:8px!important}.tps-name small{display:block;font-size:10px;color:#888;margin-top:2px}.tps-name:hover{background:#f5f5f5!important}.tps-row.is-selected .tps-name{font-weight:650}
+        .tps-apply{flex:none;background:#111!important;color:#fff!important;border:0!important;border-radius:999px!important;padding:7px 12px!important;font:inherit;font-size:11px;cursor:pointer;margin-right:8px}.tps-apply:hover{background:#333!important}.tps-empty{padding:35px 10px;text-align:center;font-size:13px;color:#888}.tps-footer{padding:12px 20px 16px;border-top:1px solid #eee;color:#999;font-size:10px;letter-spacing:.4px}.tps-dialog button:focus-visible{outline:2px solid #111;outline-offset:2px}
+        @media(max-width:480px){.tps-overlay{align-items:flex-end;padding:12px;padding-bottom:max(12px,env(safe-area-inset-bottom))}.tps-dialog{max-width:100%;border-radius:22px}.tps-list{max-height:42dvh}}
+        `;
+        document.head.appendChild(style);
+        modal = document.createElement('div');
+        modal.className = 'tps-overlay'; modal.hidden = true;
+        modal.innerHTML = `<section class="tps-dialog" role="dialog" aria-modal="true" aria-labelledby="tps-title"><header class="tps-header"><div><div class="tps-kicker">YOUR COLLECTION</div><h2 class="tps-title" id="tps-title">选择预设</h2></div><button class="tps-icon tps-close" type="button" aria-label="关闭"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="m6 6 12 12M18 6 6 18"/></svg></button></header><div class="tps-search"><svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6"><circle cx="10.5" cy="10.5" r="6.5"/><path d="m16 16 4.5 4.5"/></svg><input class="tps-input" type="text" inputmode="search" placeholder="输入名称的部分字样…" aria-label="搜索预设" autocomplete="off"><button class="tps-icon tps-clear" type="button" aria-label="清空搜索">×</button></div><div class="tps-count" aria-live="polite"></div><div class="tps-list"></div><footer class="tps-footer">点击选择预设</footer></section>`;
+        document.body.appendChild(modal);
+        input = modal.querySelector('input'); list = modal.querySelector('.tps-list'); count = modal.querySelector('.tps-count'); clear = modal.querySelector('.tps-clear');
+        input.addEventListener('input', render);
+        input.addEventListener('compositionstart', () => composing = true);
+        input.addEventListener('compositionend', () => { composing = false; render(); });
+        clear.onclick = () => { input.value = ''; render(); input.focus(); };
+        modal.querySelector('.tps-close').onclick = close;
+        modal.addEventListener('click', event => { if (event.target === modal) close(); });
+        modal.addEventListener('keydown', event => {
+            if (event.key === 'Escape') { event.preventDefault(); close(); }
+            if (event.key === 'Enter' && event.target === input && !event.isComposing && !composing) { event.preventDefault(); list.querySelector('.tps-name')?.click(); }
+            if (event.key === 'Tab') {
+                const focusable = [...modal.querySelectorAll('button,input')].filter(el => !el.disabled && el.getClientRects().length);
+                const first = focusable[0], last = focusable[focusable.length - 1];
+                if (event.shiftKey && document.activeElement === first) { event.preventDefault(); last.focus(); }
+                else if (!event.shiftKey && document.activeElement === last) { event.preventDefault(); first.focus(); }
+            }
+        });
+    }
+    function close() {
+        if (!modal) return;
+        modal.hidden = true;
+        document.body.style.overflow = previousOverflow;
+        returnFocus?.setAttribute('aria-expanded', 'false');
+        if (returnFocus?.isConnected) returnFocus.focus({preventScroll:true});
+        source = null;
+    }
+    function choose(option) {
+        if (!source || option.disabled || !source.contains(option)) return;
+        const select = source;
+        select.value = option.value;
+        // 原有 onchange 负责填充/切换；专属预设仍由聊天设置的保存按钮保存。
+        select.dispatchEvent(new Event('change', {bubbles:true}));
+        sync(select);
+        close();
+    }
+    function render() {
+        if (!source || modal.hidden) return;
+        const query = input.value;
+        const options = [...source.options].filter(option => !option.disabled && !option.hidden);
+        const results = options.map((option, index) => ({option,index,rank:score(option.textContent,query)}))
+            .filter(item => item.rank).sort((a,b) => b.rank-a.rank || a.index-b.index);
+        count.textContent = `${results.length} / ${options.length} PRESETS`;
+        clear.style.visibility = query ? 'visible' : 'hidden';
+        list.replaceChildren(); list.scrollTop = 0;
+        if (!results.length) {
+            const empty = document.createElement('div'); empty.className = 'tps-empty';
+            empty.textContent = options.length ? '没有匹配的预设，换个字试试' : '还没有预设，可以先导入或保存';
+            list.appendChild(empty); return;
+        }
+        results.forEach(({option}) => {
+            const selected = source.value === option.value;
+            const row = document.createElement('div'); row.className = 'tps-row' + (selected ? ' is-selected' : '');
+            const name = document.createElement('button'); name.type = 'button'; name.className = 'tps-name';
+            name.textContent = option.textContent;
+            if (selected) { const note = document.createElement('small'); note.textContent = '当前选择'; name.appendChild(note); }
+            name.onclick = () => choose(option);
+            const apply = document.createElement('button'); apply.type = 'button'; apply.className = 'tps-apply';
+            apply.textContent = selected ? '已选' : '选择'; apply.setAttribute('aria-label',`选择 ${option.textContent}`);
+            apply.onclick = () => choose(option);
+            row.append(name,apply); list.appendChild(row);
+        });
+    }
+    function sync(select) {
+        const button = buttons.get(select);
+        const label = select.selectedOptions[0]?.textContent || '选择预设';
+        if (button) {
+            const span = button.querySelector('span');
+            if (span.textContent !== label) span.textContent = label;
+            button.title = label;
+            button.disabled = select.disabled;
+        }
+        if (source === select && !modal.hidden) render();
+    }
+    function attach(select) {
+        if (buttons.has(select)) return;
+        ensureModal();
+        const config = configurations[select.id];
+        const button = document.createElement('button'); button.type = 'button';
+        button.className = 'tps-trigger' + (config.wide ? ' tps-wide' : '');
+        button.setAttribute('aria-haspopup','dialog'); button.setAttribute('aria-expanded','false');
+        button.setAttribute('aria-label',config.title + '，打开搜索');
+        button.innerHTML = '<span>选择预设</span><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6"><circle cx="10" cy="10" r="6"/><path d="m15 15 5 5"/></svg>';
+        select.hidden = true; select.style.setProperty('display','none','important');
+        select.after(button); buttons.set(select,button);
+        select.addEventListener('change',() => sync(select));
+        new MutationObserver(() => sync(select)).observe(select, {childList:true, subtree:true, characterData:true, attributes:true});
+        button.onclick = () => {
+            source = select; returnFocus = button; input.value = '';
+            modal.querySelector('.tps-title').textContent = config.title;
+            modal.querySelector('.tps-footer').textContent = config.hint;
+            input.setAttribute('aria-label','搜索' + config.title);
+            previousOverflow = document.body.style.overflow;
+            document.body.style.overflow = 'hidden'; modal.hidden = false;
+            button.setAttribute('aria-expanded','true'); render(); input.focus({preventScroll:true});
+        };
+        sync(select);
+    }
+    function start() {
+        document.querySelectorAll(selector).forEach(attach);
+        // 仅检查新增节点，兼容聊天设置 HTML 动态注入，不扫描聊天记录。
+        new MutationObserver(records => {
+            for (const record of records) for (const node of record.addedNodes) {
+                if (node.nodeType !== 1) continue;
+                if (node.matches(selector)) attach(node);
+                node.querySelectorAll(selector).forEach(attach);
+            }
+            for (const [select, button] of buttons) if (!select.isConnected) {
+                if (source === select) close();
+                button.remove(); buttons.delete(select);
+            }
+        }).observe(document.body, {childList:true, subtree:true});
+    }
+    if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded',start,{once:true});
+    else start();
+})();

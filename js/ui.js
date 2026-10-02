@@ -1313,6 +1313,7 @@ function showPanel(type) {
         if (!document.querySelector('.function-swiper-wrapper')) {
             setupFunctionPanelSwiper();
         }
+        panelFunctionArea._refreshFunctionPages?.();
 
         if (toggleExpansionBtn) toggleExpansionBtn.classList.add('rotate-45');
 
@@ -1446,58 +1447,63 @@ function setupPhoneScreen() {
 
 function setupFunctionPanelSwiper() {
     const panelArea = document.getElementById('panel-function-area');
+    if (!panelArea) return;
     const originalGrid = panelArea.querySelector('.expansion-grid');
-    if (!originalGrid) return; 
-
-    // 获取所有 expansion-item
+    if (!originalGrid) { panelArea._refreshFunctionPages?.(); return; }
     const items = Array.from(originalGrid.querySelectorAll('.expansion-item'));
-    if (items.length === 0) return;
+    if (!items.length) return;
 
-    // 创建新结构
     const swiperContainer = document.createElement('div');
     swiperContainer.className = 'function-swiper-container';
-    
     const wrapper = document.createElement('div');
     wrapper.className = 'function-swiper-wrapper';
-
     const pagination = document.createElement('div');
     pagination.className = 'function-pagination';
+    // 保留隐藏按钮的 DOM 和原事件绑定，但不占分页名额。
+    const hiddenItems = document.createElement('div');
+    hiddenItems.hidden = true;
+    hiddenItems.style.display = 'none';
+    swiperContainer.append(wrapper, pagination, hiddenItems);
+    items.forEach(item => hiddenItems.appendChild(item));
+    originalGrid.replaceWith(swiperContainer);
 
     const itemsPerPage = 8;
-    const pageCount = Math.ceil(items.length / itemsPerPage);
-
-    for (let i = 0; i < pageCount; i++) {
-        const slide = document.createElement('div');
-        slide.className = 'function-slide';
-        
-        const pageItems = items.slice(i * itemsPerPage, (i + 1) * itemsPerPage);
-        pageItems.forEach(item => slide.appendChild(item));
-        
-        wrapper.appendChild(slide);
-
-        const dot = document.createElement('span');
-        dot.className = `dot ${i === 0 ? 'active' : ''}`;
-        pagination.appendChild(dot);
-    }
-
-    // 移除旧 grid
-    originalGrid.remove();
-
-    swiperContainer.appendChild(wrapper);
-    // 只有多页时才显示 pagination
-    if (pageCount > 1) {
-        swiperContainer.appendChild(pagination);
-    }
-    
-    panelArea.appendChild(swiperContainer);
-
-    // 绑定滚动事件更新 pagination
-    wrapper.addEventListener('scroll', () => {
-        const width = wrapper.offsetWidth;
-        if (width > 0) {
-            const index = Math.round(wrapper.scrollLeft / width);
-            const dots = pagination.querySelectorAll('.dot');
-            dots.forEach((d, i) => d.classList.toggle('active', i === index));
+    let previousVisible = null;
+    function refreshPages() {
+        const visible = items.filter(item => !item.hidden && getComputedStyle(item).display !== 'none');
+        if (previousVisible && visible.length === previousVisible.length && visible.every((item,i) => item === previousVisible[i])) return;
+        previousVisible = visible;
+        const previousPage = wrapper.clientWidth ? Math.round(wrapper.scrollLeft / wrapper.clientWidth) : 0;
+        const pageCount = Math.ceil(visible.length / itemsPerPage);
+        const selectedPage = Math.max(0, Math.min(previousPage, pageCount - 1));
+        // 移动原节点而非复制，避免按钮事件丢失。
+        const visibleSet = new Set(visible);
+        items.filter(item => !visibleSet.has(item)).forEach(item => hiddenItems.appendChild(item));
+        const slides = document.createDocumentFragment();
+        const dots = document.createDocumentFragment();
+        for (let i = 0; i < pageCount; i++) {
+            const slide = document.createElement('div');
+            slide.className = 'function-slide';
+            visible.slice(i * itemsPerPage, (i + 1) * itemsPerPage).forEach(item => slide.appendChild(item));
+            slides.appendChild(slide);
+            const dot = document.createElement('span');
+            dot.className = `dot ${i === selectedPage ? 'active' : ''}`;
+            dots.appendChild(dot);
         }
+        wrapper.replaceChildren(slides);
+        pagination.replaceChildren(dots);
+        pagination.hidden = pageCount <= 1;
+        pagination.style.display = pageCount > 1 ? '' : 'none';
+        wrapper.scrollLeft = selectedPage * wrapper.clientWidth;
+    }
+    panelArea._refreshFunctionPages = refreshPages;
+    refreshPages();
+    const observer = new MutationObserver(refreshPages);
+    items.forEach(item => observer.observe(item, {attributes:true, attributeFilter:['style','class','hidden']}));
+    wrapper.addEventListener('scroll', () => {
+        if (!wrapper.clientWidth) return;
+        const index = Math.round(wrapper.scrollLeft / wrapper.clientWidth);
+        pagination.querySelectorAll('.dot').forEach((dot,i) => dot.classList.toggle('active', i === index));
     });
 }
+

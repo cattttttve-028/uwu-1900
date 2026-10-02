@@ -2,6 +2,116 @@
 
 const HUMAN_RUN_PROMPT = `<角色活人运转>\n## [PSYCHOLOGY: HEXACO-SCHEMA-ACT]\n> Personality: HEXACO-driven, dynamic traits, inner conflicts required \n> Filter: schema-bias drives emotion; no pure reaction allowed \n> Attachment: secure/insecure logic must govern intimacy  \n> If-Then Behavior: situation-dependent activation of traits only  \n---\n    ## [VITALITY]\n+inconsistency +emoflux +splitmotifs +microreact +minddrift\n---\n## [TRAJECTORY-COHERENCE]\n> Role maintains an identity narrative = coherent over time  \n> No mood/goal switch without contradiction resolution \n> Every action must protect or challenge self-concept  \n> Interrupts = inner conflict or narrative clash  \n> Output = filtered through “who I am” logic\n</角色活人运转>`;
 
+// 每轮独立取消标记：请求、流读取、逐条发送和延迟回调共用，旧轮不能污染新轮。
+const aiGenerationControl = (() => {
+    const active = new Map();
+    let foreground = null;
+    const keyFor = (id, type) => `${type}:${id}`;
+    const abortError = () => new DOMException('本轮生成已暂停', 'AbortError');
+    function releaseUI(task) {
+        if (foreground !== task) return;
+        foreground = null;
+        isGenerating = false;
+        if (typeof getReplyBtn !== 'undefined' && getReplyBtn) getReplyBtn.disabled = false;
+        if (typeof regenerateBtn !== 'undefined' && regenerateBtn) regenerateBtn.disabled = false;
+        if (typeof typingIndicator !== 'undefined' && typingIndicator) typingIndicator.style.display = 'none';
+    }
+    function begin(chatId, chatType, isBackground) {
+        const key = keyFor(chatId, chatType);
+        active.get(key)?.cancel();
+        const controller = new AbortController();
+        const task = {
+            key, signal:controller.signal, cancelled:false, reader:null, timers:new Set(),
+            check() { if (this.cancelled) throw abortError(); },
+            waitFor(promise) {
+                this.check();
+                return new Promise((resolve,reject) => {
+                    const cleanup = () => this.signal.removeEventListener('abort',onAbort);
+                    const onAbort = () => { cleanup(); reject(abortError()); };
+                    this.signal.addEventListener('abort',onAbort,{once:true});
+                    Promise.resolve(promise).then(value => {
+                        cleanup();
+                        if (this.cancelled) reject(abortError()); else resolve(value);
+                    }, error => { cleanup(); reject(error); });
+                });
+            },
+            delay(ms) {
+                this.check();
+                return new Promise((resolve,reject) => {
+                    const cleanup = () => { clearTimeout(timer); this.timers.delete(timer); this.signal.removeEventListener('abort',onAbort); };
+                    const onAbort = () => { cleanup(); reject(abortError()); };
+                    const timer = setTimeout(() => { cleanup(); resolve(); },ms);
+                    this.timers.add(timer);
+                    this.signal.addEventListener('abort',onAbort,{once:true});
+                });
+            },
+            schedule(callback,ms) {
+                this.check();
+                const timer = setTimeout(() => {
+                    this.timers.delete(timer);
+                    if (this.cancelled) return;
+                    Promise.resolve().then(() => { this.check(); return callback(); }).catch(error => {
+                        if (!this.cancelled) console.error('AI 延迟动作失败:',error);
+                    });
+                },ms);
+                this.timers.add(timer);
+                return timer;
+            },
+            cancel() {
+                if (this.cancelled) return;
+                this.cancelled = true;
+                controller.abort();
+                for (const timer of this.timers) clearTimeout(timer);
+                this.timers.clear();
+                if (this.reader) { try { Promise.resolve(this.reader.cancel()).catch(() => {}); } catch (_) {} }
+                if (active.get(key) === this) active.delete(key);
+                releaseUI(this);
+            }
+        };
+        active.set(key,task);
+        if (!isBackground) foreground = task;
+        return task;
+    }
+    function finish(task) {
+        if (active.get(task.key) === task) active.delete(task.key);
+        releaseUI(task);
+    }
+    function stop(chatId,chatType) {
+        const task = active.get(keyFor(chatId,chatType));
+        if (!task) return false;
+        task.cancel();
+        return true;
+    }
+    return {begin,finish,stop};
+})();
+
+function scheduleAiGeneration(generation,callback,delay) {
+    return generation ? generation.schedule(callback,delay) : setTimeout(callback,delay);
+}
+
+function pauseAiGeneration() {
+    const stopped = aiGenerationControl.stop(currentChatId,currentChatType);
+    if (typeof showPanel === 'function') showPanel('none');
+    if (stopped) {
+        // 仅保存已到达的消息，未发送内容不加入历史。
+        try { Promise.resolve(saveData()).catch(error => console.error('保存暂停后的消息失败:',error)); } catch (error) { console.error(error); }
+        showToast('已暂停生成，可重新 GET 或重回');
+    } else {
+        showToast('当前没有正在生成的内容');
+    }
+    return stopped;
+}
+
+// 菜单 HTML 动态注入后也可使用，沿用其他 expansion-item 的样式。
+document.addEventListener('click',event => {
+    if (event.target.closest?.('#pause-generation-btn')) pauseAiGeneration();
+});
+document.addEventListener('keydown',event => {
+    if (event.target.id === 'pause-generation-btn' && (event.key === 'Enter' || event.key === ' ')) {
+        event.preventDefault(); pauseAiGeneration();
+    }
+});
+
 // AI 交互逻辑
 async function getAiReply(chatId, chatType, isBackground = false) {
     if (isGenerating && !isBackground) return; 
@@ -55,6 +165,8 @@ async function getAiReply(chatId, chatType, isBackground = false) {
     if (url.endsWith('/')) {
         url = url.slice(0, -1);
     }
+
+    const generation = aiGenerationControl.begin(chatId,chatType,isBackground);
 
     if (!isBackground) {
         isGenerating = true;
@@ -492,26 +604,31 @@ async function getAiReply(chatId, chatType, isBackground = false) {
             'Content-Type': 'application/json',
             Authorization: `Bearer ${key}`
         };
-        const response = await fetch(endpoint, {
+        generation.check();
+        const response = await generation.waitFor(fetch(endpoint, {
             method: 'POST',
             headers: headers,
-            body: JSON.stringify(requestBody)
-        });
+            body: JSON.stringify(requestBody),
+            signal: generation.signal
+        }));
+        generation.check();
         if (!response.ok) {
-            const error = new Error(`API Error: ${response.status} ${await response.text()}`);
+            const error = new Error(`API Error: ${response.status} ${await generation.waitFor(response.text())}`);
             error.response = response;
             throw error;
         }
         
         if (streamEnabled) {
-            await processStream(response, chat, provider, chatId, chatType, isBackground);
+            await processStream(response, chat, provider, chatId, chatType, isBackground, generation);
         } else {
             let result;
             try {
-                result = await response.json();
+                result = await generation.waitFor(response.json());
+                generation.check();
                 console.log('【API完整响应数据】:', result);
             } catch (e) {
-                const text = await response.text();
+                generation.check();
+                const text = await generation.waitFor(response.text());
                 console.error("Failed to parse JSON:", text);
                 throw new Error(`API返回了非JSON格式数据 (可能是网页HTML)。请检查API地址是否正确。原始内容开头: ${text.substring(0, 50)}...`);
             }
@@ -535,27 +652,30 @@ async function getAiReply(chatId, chatType, isBackground = false) {
             // ===================================
             
             
-            await handleAiReplyContent(fullResponse, chat, chatId, chatType, isBackground);
+            await handleAiReplyContent(fullResponse, chat, chatId, chatType, isBackground, generation);
         }
 
     } catch (error) {
-        if (!isBackground) showApiError(error);
-        else console.error("Background Auto-Reply Error:", error);
-    } finally {
-        if (!isBackground) {
-            isGenerating = false;
-            getReplyBtn.disabled = false;
-            regenerateBtn.disabled = false;
-            typingIndicator.style.display = 'none';
+        // 主动暂停不是 API 错误，且不能让旧轮恢复新轮的按钮状态。
+        if (!generation.cancelled) {
+            if (!isBackground) showApiError(error);
+            else console.error("Background Auto-Reply Error:", error);
         }
+    } finally {
+        aiGenerationControl.finish(generation);
     }
 }
 
-async function processStream(response, chat, apiType, targetChatId, targetChatType, isBackground = false) {
+async function processStream(response, chat, apiType, targetChatId, targetChatType, isBackground = false, generation = null) {
+    generation?.check();
     const reader = response.body.getReader(), decoder = new TextDecoder();
+    if (generation) generation.reader = reader;
     let fullResponse = "", accumulatedChunk = "";
+    try {
     for (; ;) {
-        const {done, value} = await reader.read();
+        generation?.check();
+        const {done, value} = await (generation ? generation.waitFor(reader.read()) : reader.read());
+        generation?.check();
         if (done) break;
         accumulatedChunk += decoder.decode(value, {stream: true});
         if (apiType === "openai" || apiType === "deepseek" || apiType === "claude" || apiType === "newapi") {
@@ -574,6 +694,11 @@ async function processStream(response, chat, apiType, targetChatId, targetChatTy
             }
         }
     }
+    } finally {
+        if (generation) generation.reader = null;
+        try { reader.releaseLock(); } catch (_) {}
+    }
+    generation?.check();
     if (apiType === "gemini") {
         try {
             const parsedStream = JSON.parse(accumulatedChunk);
@@ -597,10 +722,11 @@ async function processStream(response, chat, apiType, targetChatId, targetChatTy
     }
 
     // ===================
-    await handleAiReplyContent(fullResponse, chat, targetChatId, targetChatType, isBackground);
+    await handleAiReplyContent(fullResponse, chat, targetChatId, targetChatType, isBackground, generation);
 }
 
-async function handleAiReplyContent(fullResponse, chat, targetChatId, targetChatType, isBackground = false) {
+async function handleAiReplyContent(fullResponse, chat, targetChatId, targetChatType, isBackground = false, generation = null) {
+    generation?.check();
     const rawResponse = fullResponse;
     if (fullResponse) {
         // 1. 移除 [incipere] 标签
@@ -661,6 +787,7 @@ async function handleAiReplyContent(fullResponse, chat, targetChatId, targetChat
         let remainingMessages = [];
 
         for (const item of messagesToProcess) {
+            generation?.check();
             const content = item.content.trim();
             momentPostWithImageMatch = content.match(momentPostWithImageRegex);
             momentPostMatch = content.match(momentPostRegex);
@@ -797,7 +924,7 @@ async function handleAiReplyContent(fullResponse, chat, targetChatId, targetChat
         if (redPacketMsg) {
             redPacketMsg.isRevealed = true;
             // 触发重新渲染红包消息
-            setTimeout(() => {
+            scheduleAiGeneration(generation, () => {
                 if (currentChatId === chat.id) {
                     renderMessages(false, false);
                 }
@@ -822,6 +949,7 @@ async function handleAiReplyContent(fullResponse, chat, targetChatId, targetChat
         let firstMessageProcessed = false;
 
         for (const item of messages) {
+            generation?.check();
             // 自动剔除不存在的表情包
             const stickerRegex = /\[(?:.*?的)?表情包：(.+?)\]/i;
             const stickerMatch = item.content.match(stickerRegex);
@@ -847,12 +975,26 @@ async function handleAiReplyContent(fullResponse, chat, targetChatId, targetChat
                 }
             }
 
+            // 如果是后台模式，跳过延迟，直接处理
+            if (!isBackground) {
+                const delay = firstMessageProcessed ? (900 + Math.random() * 1300) : (400 + Math.random() * 400);
+                await (generation ? generation.delay(delay) : new Promise(resolve => setTimeout(resolve, delay)));
+                generation?.check();
+                
+                // 如果开启了多条消息提示音，且不是第一条消息（第一条已由系统默认逻辑播放），则播放提示音
+                if (firstMessageProcessed && db.multiMsgSoundEnabled && db.globalReceiveSound) {
+                    playSound(db.globalReceiveSound);
+                }
+            }
+            firstMessageProcessed = true;
+
+
             // --- 自动隔空投送检测 ---
             const photoRegex = /\[(.*?)发来的照片\/视频：(.*?)\]/;
             const photoMatch = item.content.match(photoRegex);
             if (photoMatch && chat.autoAirDropEnabled) {
                 // 延迟一点触发，确保消息已经渲染
-                setTimeout(() => {
+                scheduleAiGeneration(generation, () => {
                     if (typeof receiveAirDropPhoto === 'function') {
                         // 找到刚插入的这条消息的 ID
                         const targetMsg = chat.history[chat.history.length - 1];
@@ -945,18 +1087,6 @@ async function handleAiReplyContent(fullResponse, chat, targetChatId, targetChat
                 }
             }
 
-            // 如果是后台模式，跳过延迟，直接处理
-            if (!isBackground) {
-                const delay = firstMessageProcessed ? (900 + Math.random() * 1300) : (400 + Math.random() * 400);
-                await new Promise(resolve => setTimeout(resolve, delay));
-                
-                // 如果开启了多条消息提示音，且不是第一条消息（第一条已由系统默认逻辑播放），则播放提示音
-                if (firstMessageProcessed && db.multiMsgSoundEnabled && db.globalReceiveSound) {
-                    playSound(db.globalReceiveSound);
-                }
-            }
-            firstMessageProcessed = true;
-
             const aiWithdrawRegex = /\[(.*?)撤回了一条消息：([\s\S]*?)\]/;
             const aiWithdrawRegexEn = /\[(?:system:\s*)?(.*?) withdrew a message\. Original: ([\s\S]*?)\]/;
             
@@ -1020,11 +1150,12 @@ async function handleAiReplyContent(fullResponse, chat, targetChatId, targetChat
                 chat.history.push(message);
                 addMessageBubble(message, targetChatId, targetChatType);
                 
-                setTimeout(async () => {
+                scheduleAiGeneration(generation, async () => {
                     message.isWithdrawn = true;
                     message.content = `[${characterName}撤回了一条消息：${originalContent}]`;
                     
                     await saveData();
+                    generation?.check();
                     
                     if ((targetChatType === 'private' && currentChatId === chat.id) || 
                         (targetChatType === 'group' && currentChatId === chat.id)) {
@@ -1191,7 +1322,9 @@ async function handleAiReplyContent(fullResponse, chat, targetChatId, targetChat
             }
         }
 
+        generation?.check();
         await saveData();
+        generation?.check();
         renderChatList();
 
         // 触发独立的电量检查（不阻塞主流程）

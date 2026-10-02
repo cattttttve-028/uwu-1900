@@ -95,6 +95,12 @@ const chatRoomHtml = `
                         </div>
                         <span class="expansion-item-name">重回</span>
                     </div>
+                    <div class="expansion-item" id="pause-generation-btn" role="button" tabindex="0" aria-label="暂停生成">
+                        <div class="expansion-item-icon">
+                            <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="currentColor"><path fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 13h5m3 3v-4m0-4h3a2 2 0 0 1 2 2v1c0 .554-.225 1.055-.589 1.417M13 13h-1m8-5v8M9 16v-5.5a2.5 2.5 0 0 0-5 0V16M3 3l18 18"/></svg>
+                        </div>
+                        <span class="expansion-item-name">暂停生成</span>
+                    </div>
                     <div class="expansion-item" id="photo-video-btn">
                         <div class="expansion-item-icon">
                             <svg viewBox="0 0 24 24" fill="currentColor"><path d="M4,4H7L9,2H15L17,4H20A2,2 0 0,1 22,6V18A2,2 0 0,1 20,20H4A2,2 0 0,1 2,18V6A2,2 0 0,1 4,4M12,7A5,5 0 0,0 7,12A5,5 0 0,0 12,17A5,5 0 0,0 17,12A5,5 0 0,0 12,7M12,9A3,3 0 0,1 15,12A3,3 0 0,1 12,15A3,3 0 0,1 9,12A3,3 0 0,1 12,9Z"/></svg>
